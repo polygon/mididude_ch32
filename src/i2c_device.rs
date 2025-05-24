@@ -1,5 +1,7 @@
 use ch32_hal::i2c::{Instance, SclPin, SdaPin};
-use ch32_hal::{pac::gpio::Gpio, Peripherals};
+use ch32_hal::interrupt::typelevel::{Binding, Interrupt};
+use ch32_hal::into_ref;
+use ch32_hal::{pac::gpio::Gpio, Peripherals, Peripheral};
 use core::fmt::Write;
 use core::marker::PhantomData;
 
@@ -86,16 +88,18 @@ pub struct I2cSlave<'d, T: Instance> {
 
 impl<'d, T: Instance> I2cSlave<'d, T> {
     /// Create a new instance.
-    pub fn new(
-        _peri: Peri<'d, T>,
-        scl: Peri<'d, impl SclPin<T>>,
-        sda: Peri<'d, impl SdaPin<T>>,
-        _irq: impl Binding<T::Interrupt, InterruptHandler<T>>,
+    pub fn new<const REMAP: u8> (
+        _peri: impl Peripheral<P = T> + 'd,
+        scl: impl Peripheral<P = impl SclPin<T, REMAP>> + 'd,
+        sda: impl Peripheral<P = impl SdaPin<T, REMAP>> + 'd,
         config: Config,
     ) -> Self {
         assert!(config.addr != 0);
 
+        T::regs();
+
         // Configure SCL & SDA pins
+        into_ref!(scl, sda);
         set_up_i2c_pin(&scl);
         set_up_i2c_pin(&sda);
 
