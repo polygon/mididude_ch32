@@ -1,10 +1,13 @@
 use ch32_hal::gpio::Pin;
 use ch32_hal::interrupt::typelevel::{Binding, Interrupt};
 use ch32_hal::pac::gpio::vals::{Cnf, Mode};
+use ch32_hal::time::Hertz;
 use ch32_hal::{interrupt, into_ref, peripherals};
 use ch32_hal::{pac::gpio::Gpio, Peripheral, Peripherals};
 use core::fmt::Write;
+use core::future;
 use core::marker::PhantomData;
+use core::task::Poll;
 use embassy_sync::waitqueue::AtomicWaker;
 
 /// Event interrupt handler.
@@ -107,6 +110,8 @@ pub struct Config {
     pub addr: u8,
     /// Control if the peripheral should ack to and report general calls.
     pub general_call: bool,
+    // Frequency
+    pub freq: u32,
 }
 
 impl Default for Config {
@@ -114,6 +119,7 @@ impl Default for Config {
         Self {
             addr: 0x55,
             general_call: true,
+            freq: 48000000,
         }
     }
 }
@@ -131,6 +137,7 @@ impl<'d, T: Instance> I2cSlave<'d, T> {
         config: Config,
         sda_pin: impl SdaPin<T, REMAP>,
         scl_pin: impl SclPin<T, REMAP>,
+        freq: Hertz,
         _irq: impl interrupt::typelevel::Binding<T::EventInterrupt, EventInterruptHandler<T>>
             + interrupt::typelevel::Binding<T::ErrorInterrupt, ErrorInterruptHandler<T>>
             + 'd,
@@ -172,6 +179,13 @@ impl<'d, T: Instance> I2cSlave<'d, T> {
 
         ret.reset();
 
+        T::EventInterrupt::unpend();
+        T::ErrorInterrupt::unpend();
+        unsafe {
+            T::EventInterrupt::enable();
+            T::ErrorInterrupt::enable();
+        }
+
         ret
     }
 
@@ -191,17 +205,40 @@ impl<'d, T: Instance> I2cSlave<'d, T> {
             r.set_addmode(self.config.general_call);
         });
 
-        // Should not be needed for slave mode
-        /*i2c.ctlr2().modify(|r| {
-            r.set_freq(48);
+        // Set clock freq
+        let freq_set = (self.config.freq / 1000000) as u8;
+        assert!(freq_set >= 8);
+        assert!(freq_set <= 48);
+        i2c.ctlr2().modify(|r| {
+            r.set_freq((self.config.freq / 1000000) as u8);
         });
-        i2c.ckcfgr().modify(|r| {
-            r.set_ccr((48000000. / 200000.) as u16);
-        });*/
 
         i2c.ctlr1().modify(|r| {
             r.set_pe(true);
         });
+    }
+
+    /// Calls `f` to check if we are ready or not.
+    /// If not, `g` is called once(to eg enable the required interrupts).
+    /// The waker will always be registered prior to calling `f`.
+    #[inline(always)]
+    async fn wait_on<F, U, G>(&mut self, mut f: F, mut g: G) -> U
+    where
+        F: FnMut(&mut Self) -> Poll<U>,
+        G: FnMut(&mut Self),
+    {
+        future::poll_fn(|cx| {
+            // Register prior to checking the condition
+            T::state().waker.register(cx.waker());
+            let r = f(self);
+
+            if r.is_pending() {
+                g(self);
+            }
+
+            r
+        })
+        .await
     }
 }
 
