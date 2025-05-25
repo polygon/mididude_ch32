@@ -331,11 +331,25 @@ pub fn monitor_addr(uart: &mut impl Write) {
     i2c.ctlr1().modify(|r| {
         r.set_ack(true);
     });
-    while i2c.star1().read().addr() == false {}
-    if i2c.star2().read().tra() {
+    let mut star1;
+    let mut star2;
+    loop {
+        /* Do not switch order, reading star1 before star2 will cause ADDR to be cleared and in case of
+        transmit we will transmit what is currently inside the data register */
+        star2 = i2c.star2().read();
+        star1 = i2c.star1().read();
+
+        if star1.addr() {
+            break;
+        }
+    }
+
+    if star2.tra() {
         i2c.datar().write(|r| {
             r.set_datar(0x42);
         });
+        // Read star2 again, to clear ADDR and start data transfer
+        i2c.star2().read();
         i2c.ctlr1().modify(|r| {
             r.set_stop(true);
         });
