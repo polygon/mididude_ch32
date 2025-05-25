@@ -1,9 +1,47 @@
-use ch32_hal::i2c::{Instance, SclPin, SdaPin};
+use ch32_hal::gpio::Pin;
 use ch32_hal::interrupt::typelevel::{Binding, Interrupt};
-use ch32_hal::into_ref;
-use ch32_hal::{pac::gpio::Gpio, Peripherals, Peripheral};
+use ch32_hal::pac::gpio::vals::{Cnf, Mode};
+use ch32_hal::{interrupt, into_ref, peripherals};
+use ch32_hal::{pac::gpio::Gpio, Peripheral, Peripherals};
 use core::fmt::Write;
 use core::marker::PhantomData;
+use embassy_sync::waitqueue::AtomicWaker;
+
+/// Event interrupt handler.
+pub struct EventInterruptHandler<T: Instance> {
+    _phantom: PhantomData<T>,
+}
+
+impl<T: Instance> interrupt::typelevel::Handler<T::EventInterrupt> for EventInterruptHandler<T> {
+    unsafe fn on_interrupt() {
+        on_interrupt::<T>()
+    }
+}
+
+/// Error interrupt handler.
+pub struct ErrorInterruptHandler<T: Instance> {
+    _phantom: PhantomData<T>,
+}
+
+impl<T: Instance> interrupt::typelevel::Handler<T::ErrorInterrupt> for ErrorInterruptHandler<T> {
+    unsafe fn on_interrupt() {
+        on_interrupt::<T>()
+    }
+}
+
+pub unsafe fn on_interrupt<T: Instance>() {
+    let regs = T::regs();
+    // i2c v2 only woke the task on transfer complete interrupts. v1 uses interrupts for a bunch of
+    // other stuff, so we wake the task on every interrupt.
+    T::state().waker.wake();
+    critical_section::with(|_| {
+        // Clear event interrupt flag.
+        regs.ctlr2().modify(|w| {
+            w.set_itevten(false);
+            w.set_iterren(false);
+        });
+    });
+}
 
 // I2C error
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -66,7 +104,7 @@ pub enum ReadStatus {
 #[derive(defmt::Format)]
 pub struct Config {
     /// Target Address
-    pub addr: u16,
+    pub addr: u8,
     /// Control if the peripheral should ack to and report general calls.
     pub general_call: bool,
 }
@@ -88,20 +126,44 @@ pub struct I2cSlave<'d, T: Instance> {
 
 impl<'d, T: Instance> I2cSlave<'d, T> {
     /// Create a new instance.
-    pub fn new<const REMAP: u8> (
+    pub fn new<const REMAP: u8>(
         _peri: impl Peripheral<P = T> + 'd,
-        scl: impl Peripheral<P = impl SclPin<T, REMAP>> + 'd,
-        sda: impl Peripheral<P = impl SdaPin<T, REMAP>> + 'd,
         config: Config,
+        sda_pin: impl SdaPin<T, REMAP>,
+        scl_pin: impl SclPin<T, REMAP>,
+        _irq: impl interrupt::typelevel::Binding<T::EventInterrupt, EventInterruptHandler<T>>
+            + interrupt::typelevel::Binding<T::ErrorInterrupt, ErrorInterruptHandler<T>>
+            + 'd,
     ) -> Self {
         assert!(config.addr != 0);
 
-        T::regs();
+        // Configure pin mapping
+        let afio = ch32_hal::pac::AFIO;
+        afio.pcfr1().modify(|r| {
+            r.set_i2c1_rm(REMAP & 0x1 > 0);
+            r.set_i2c1_rm1(REMAP & 0x2 > 0);
+        });
 
-        // Configure SCL & SDA pins
-        into_ref!(scl, sda);
-        set_up_i2c_pin(&scl);
-        set_up_i2c_pin(&sda);
+        // Configure Pins
+        ch32_hal::pac::GPIO(sda_pin.port() as usize)
+            .cfglr()
+            .modify(|r| {
+                r.set_mode(sda_pin.pin() as usize, Mode::OUTPUT_50MHZ);
+                r.set_cnf(sda_pin.pin() as usize, Cnf::AF_OPEN_DRAIN_OUT);
+            });
+        ch32_hal::pac::GPIO(scl_pin.port() as usize)
+            .cfglr()
+            .modify(|r| {
+                r.set_mode(scl_pin.pin() as usize, Mode::OUTPUT_50MHZ);
+                r.set_cnf(scl_pin.pin() as usize, Cnf::AF_OPEN_DRAIN_OUT);
+            });
+
+        // Enable clock and reset module
+        let rcc = &ch32_hal::pac::RCC;
+        rcc.apb1pcenr().modify(|r| {
+            r.set_i2c1en(true);
+        });
+        rcc.apb1prstr().write(|r| r.set_i2c1rst(true));
 
         let mut ret = Self {
             phantom: PhantomData,
@@ -112,11 +174,88 @@ impl<'d, T: Instance> I2cSlave<'d, T> {
 
         ret
     }
+
+    pub fn reset(&self) {
+        let i2c = T::regs();
+
+        // Disable I2C
+        i2c.ctlr1().modify(|w| w.set_pe(false));
+
+        // soft reset
+        i2c.ctlr1().modify(|w| w.set_swrst(true));
+        i2c.ctlr1().modify(|w| w.set_swrst(false));
+
+        // Set address (currently 7 bit only), currently no general call
+        i2c.oaddr1().modify(|r| {
+            r.set_add7_1(self.config.addr);
+            r.set_addmode(self.config.general_call);
+        });
+
+        // Should not be needed for slave mode
+        /*i2c.ctlr2().modify(|r| {
+            r.set_freq(48);
+        });
+        i2c.ckcfgr().modify(|r| {
+            r.set_ccr((48000000. / 200000.) as u16);
+        });*/
+
+        i2c.ctlr1().modify(|r| {
+            r.set_pe(true);
+        });
+    }
 }
 
-pub fn init_i2c_pins() {
-    let gpio = &ch32_hal::pac::GPIOC;
+struct State {
+    #[allow(unused)]
+    waker: AtomicWaker,
 }
+
+impl State {
+    const fn new() -> Self {
+        Self {
+            waker: AtomicWaker::new(),
+        }
+    }
+}
+
+trait SealedInstance: ch32_hal::RccPeripheral + ch32_hal::RemapPeripheral {
+    fn regs() -> ch32_hal::pac::i2c::I2c;
+    fn state() -> &'static State;
+}
+
+impl SealedInstance for peripherals::I2C1 {
+    fn regs() -> ch32_hal::pac::i2c::I2c {
+        ch32_hal::pac::I2C1
+    }
+
+    fn state() -> &'static State {
+        static STATE: State = State::new();
+        &STATE
+    }
+}
+
+impl Instance for peripherals::I2C1 {
+    type EventInterrupt = ch32_hal::interrupt::typelevel::I2C1_EV;
+    type ErrorInterrupt = ch32_hal::interrupt::typelevel::I2C1_ER;
+}
+
+/// I2C peripheral instance
+#[allow(private_bounds)]
+pub trait Instance: SealedInstance + 'static {
+    /// Event interrupt for this instance
+    type EventInterrupt: interrupt::typelevel::Interrupt;
+    /// Error interrupt for this instance
+    type ErrorInterrupt: interrupt::typelevel::Interrupt;
+}
+
+pub trait SdaPin<T: Instance, const REMAP: u8 = 0>: ch32_hal::gpio::Pin {}
+pub trait SclPin<T: Instance, const REMAP: u8 = 0>: ch32_hal::gpio::Pin {}
+impl SdaPin<ch32_hal::peripherals::I2C1, 0> for ch32_hal::peripherals::PC1 {}
+impl SclPin<ch32_hal::peripherals::I2C1, 0> for ch32_hal::peripherals::PC2 {}
+impl SdaPin<ch32_hal::peripherals::I2C1, 1> for ch32_hal::peripherals::PD0 {}
+impl SclPin<ch32_hal::peripherals::I2C1, 1> for ch32_hal::peripherals::PD1 {}
+impl SdaPin<ch32_hal::peripherals::I2C1, 2> for ch32_hal::peripherals::PC6 {}
+impl SclPin<ch32_hal::peripherals::I2C1, 2> for ch32_hal::peripherals::PC5 {}
 
 pub fn init_i2c_device(address: u8, uart: &mut impl Write) {
     let rcc = &ch32_hal::pac::RCC;

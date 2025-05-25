@@ -3,6 +3,7 @@
 #![feature(type_alias_impl_trait)]
 #![feature(impl_trait_in_assoc_type)]
 
+use ch32_hal::bind_interrupts;
 use ch32_hal::pac::gpio::vals::{Cnf, Mode};
 use core::fmt::Write;
 use hal::delay::Delay;
@@ -13,7 +14,12 @@ use hal::usart::UartTx;
 use numtoa::NumToA;
 use {ch32_hal as hal, panic_halt as _};
 
-use mididude_adc::i2c_device::{self, init_i2c_device, monitor_addr};
+use mididude_adc::i2c_device::{self, init_i2c_device, monitor_addr, Config, I2cSlave};
+
+bind_interrupts!(struct Irqs {
+    I2C1_EV => mididude_adc::i2c_device::EventInterruptHandler<ch32_hal::peripherals::I2C1>;
+    I2C1_ER => mididude_adc::i2c_device::ErrorInterruptHandler<ch32_hal::peripherals::I2C1>;
+});
 
 #[qingke_rt::entry]
 fn main() -> ! {
@@ -26,12 +32,11 @@ fn main() -> ! {
 
     let mut uart = UartTx::new_blocking(p.USART1, p.PC0, Default::default()).unwrap();
 
-    hal::pac::GPIOC.cfglr().modify(|r| {
-        r.set_mode(1, Mode::OUTPUT_50MHZ);
-        r.set_mode(2, Mode::OUTPUT_50MHZ);
-        r.set_cnf(1, Cnf::AF_OPEN_DRAIN_OUT);
-        r.set_cnf(2, Cnf::AF_OPEN_DRAIN_OUT);
-    });
+    let mut config = Config::default();
+    config.addr = 0x10;
+    config.general_call = false;
+
+    let i2c = I2cSlave::new(p.I2C1, config, p.PC1, p.PC2, Irqs);
 
     let mut adc = hal::adc::Adc::new(p.ADC1, Default::default());
 
