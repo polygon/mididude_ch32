@@ -27,6 +27,7 @@
         rustc = rust-bin;
       };
       deps = [
+        pkgs.cargo-bloat
         pkgs.rust-analyzer
         pkgs.gdb
         pkgs.minicom

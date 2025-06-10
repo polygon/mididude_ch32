@@ -61,7 +61,8 @@ pub enum Error {
     ///
     /// The length parameter will always be the length of the buffer, and is
     /// provided as a convenience for matching alongside `Command::Write`.
-    PartialWrite(usize),
+    /// Second returned value is total size of this write
+    PartialWrite(usize, usize),
     /// The response buffer length was too short to contain the message
     ///
     /// The length parameter will always be the length of the buffer, and is
@@ -130,6 +131,15 @@ pub struct I2cSlave<'d, T: Instance> {
     config: Config,
 }
 
+#[derive(Debug, Clone)]
+enum TransactionState {
+    Idle,
+    Undecided,
+    Receiving,
+}
+
+static mut glob_sta: TransactionState = TransactionState::Idle;
+
 impl<'d, T: Instance> I2cSlave<'d, T> {
     /// Create a new instance.
     pub fn new<const REMAP: u8>(
@@ -137,7 +147,6 @@ impl<'d, T: Instance> I2cSlave<'d, T> {
         config: Config,
         sda_pin: impl SdaPin<T, REMAP>,
         scl_pin: impl SclPin<T, REMAP>,
-        freq: Hertz,
         _irq: impl interrupt::typelevel::Binding<T::EventInterrupt, EventInterruptHandler<T>>
             + interrupt::typelevel::Binding<T::ErrorInterrupt, ErrorInterruptHandler<T>>
             + 'd,
@@ -171,6 +180,7 @@ impl<'d, T: Instance> I2cSlave<'d, T> {
             r.set_i2c1en(true);
         });
         rcc.apb1prstr().write(|r| r.set_i2c1rst(true));
+        rcc.apb1prstr().write(|r| r.set_i2c1rst(false));
 
         let mut ret = Self {
             phantom: PhantomData,
@@ -216,16 +226,23 @@ impl<'d, T: Instance> I2cSlave<'d, T> {
         i2c.ctlr1().modify(|r| {
             r.set_pe(true);
         });
+
+        // Enable ACK
+        i2c.ctlr1().modify(|r| {
+            r.set_ack(true);
+        });
     }
+
+    // #[inline(always)]
+    // pub fn get_state(&self) ->
 
     /// Calls `f` to check if we are ready or not.
     /// If not, `g` is called once(to eg enable the required interrupts).
     /// The waker will always be registered prior to calling `f`.
     #[inline(always)]
-    async fn wait_on<F, U, G>(&mut self, mut f: F, mut g: G) -> U
+    async fn wait_on<F, U>(&mut self, mut f: F) -> U
     where
         F: FnMut(&mut Self) -> Poll<U>,
-        G: FnMut(&mut Self),
     {
         future::poll_fn(|cx| {
             // Register prior to checking the condition
@@ -233,10 +250,113 @@ impl<'d, T: Instance> I2cSlave<'d, T> {
             let r = f(self);
 
             if r.is_pending() {
-                g(self);
+                Self::enable_interrupts();
             }
 
             r
+        })
+        .await
+    }
+
+    #[inline(always)] // pretty sure this should always be inlined
+    fn enable_interrupts() -> () {
+        T::regs().ctlr2().modify(|w| {
+            w.set_iterren(true);
+            w.set_itevten(true);
+        });
+    }
+
+    pub async fn listen(
+        &mut self,
+        buf: &mut [u8],
+        uart: &mut impl Write,
+    ) -> Result<Command, Error> {
+        let i2c = T::regs();
+
+        let mut rx_len = 0;
+        let mut state = TransactionState::Idle;
+        self.wait_on(move |me| {
+            let star1 = i2c.star1().read();
+
+            //writeln!(uart, "State: {:?}, star1: 0x{:x}\r", state, star1.0);
+
+            match state {
+                TransactionState::Idle | TransactionState::Undecided => {
+                    if star1.berr() || star1.af() {
+                        i2c.star1().modify(|r| {
+                            r.set_berr(false);
+                            r.set_af(false);
+                        });
+                        return Poll::Ready(Err(Error::Abort));
+                    }
+
+                    if star1.addr() {
+                        // Acknowledge ADDR match
+                        i2c.star1().read();
+                        i2c.star2().read();
+                        state = TransactionState::Undecided;
+                    } else {
+                        if star1.rx_ne() {
+                            if let TransactionState::Undecided = state {
+                                state = TransactionState::Receiving;
+                            }
+                        } else {
+                            if star1.stopf() {
+                                // Clear STOPF bit
+                                let val = i2c.ctlr1().read();
+                                i2c.star1().read();
+                                i2c.ctlr1().write_value(val);
+                            }
+                        }
+                    }
+
+                    if star1.tx_e() {
+                        return Poll::Ready(Ok(Command::Read));
+                    }
+
+                    //Poll::Pending
+                }
+                TransactionState::Receiving => {
+                    if star1.rx_ne() {
+                        // Another byte available
+                        let new_byte = i2c.datar().read().datar();
+                        if rx_len < buf.len() {
+                            buf[rx_len] = new_byte;
+                        }
+                        rx_len += 1;
+                    }
+
+                    if star1.stopf() {
+                        // Clear stop
+                        i2c.ctlr1().write_value(i2c.ctlr1().read());
+                        if rx_len > buf.len() {
+                            return Poll::Ready(Err(Error::PartialWrite(buf.len(), rx_len)));
+                        } else {
+                            return Poll::Ready(Ok(Command::Write(rx_len)));
+                        }
+                    }
+
+                    if star1.tx_e() && star1.addr() {
+                        if rx_len > buf.len() {
+                            return Poll::Ready(Err(Error::PartialWrite(buf.len(), rx_len)));
+                        } else {
+                            return Poll::Ready(Ok(Command::Write(buf.len())));
+                        }
+                    }
+
+                    if star1.addr() {
+                        // This should not happen, possibly restart
+                        writeln!(uart, "BUG: addr seen while rx\r");
+                        return Poll::Ready(Ok(Command::Write(rx_len)));
+                    }
+
+                    //Poll::Pending
+                }
+            }
+            unsafe {
+                glob_sta = state.clone();
+            }
+            Poll::Pending
         })
         .await
     }
@@ -294,43 +414,55 @@ impl SclPin<ch32_hal::peripherals::I2C1, 1> for ch32_hal::peripherals::PD1 {}
 impl SdaPin<ch32_hal::peripherals::I2C1, 2> for ch32_hal::peripherals::PC6 {}
 impl SclPin<ch32_hal::peripherals::I2C1, 2> for ch32_hal::peripherals::PC5 {}
 
-pub fn init_i2c_device(address: u8, uart: &mut impl Write) {
-    let rcc = &ch32_hal::pac::RCC;
-    rcc.apb1pcenr().modify(|r| {
-        r.set_i2c1en(true);
-    });
-    let i2c = &ch32_hal::pac::I2C1;
-
-    i2c.ctlr1().modify(|w| w.set_pe(false)); // disale i2c
-
-    // soft reset
-    i2c.ctlr1().modify(|w| w.set_swrst(true));
-    i2c.ctlr1().modify(|w| w.set_swrst(false));
-
-    i2c.oaddr1().modify(|r| {
-        r.set_add7_1(address);
-        r.set_addmode(false);
-    });
-    i2c.ctlr2().modify(|r| {
-        r.set_freq(48);
-    });
-    i2c.ckcfgr().modify(|r| {
-        r.set_ccr((48000000. / 200000.) as u16);
-    });
-    i2c.ctlr1().modify(|r| {
-        r.set_pe(true);
-    });
-    i2c.ctlr1().modify(|r| {
-        r.set_ack(true);
-    });
-    writeln!(uart, "I2C enabled").unwrap();
-}
-
 pub fn monitor_addr(uart: &mut impl Write) {
     let i2c = &ch32_hal::pac::I2C1;
     i2c.ctlr1().modify(|r| {
         r.set_ack(true);
     });
+
+    let mut last: u32 = 0xaffeaffe;
+    loop {
+        let next = i2c.star1().read();
+        if next.0 != last {
+            last = next.0;
+            writeln!(uart, "{:#x}\r", last).unwrap();
+        }
+
+        if next.af() {
+            writeln!(uart, "ACK_ERROR\r");
+            i2c.star1().modify(|r| r.set_af(false));
+        }
+
+        if next.rx_ne() {
+            writeln!(uart, "RCV: {:#x}\r", i2c.datar().read().datar()).unwrap();
+            continue;
+        }
+
+        if next.tx_e() {
+            writeln!(uart, "WR\r").unwrap();
+            i2c.datar().write(|r| r.set_datar(0x42));
+            continue;
+        }
+
+        if next.stopf() {
+            writeln!(uart, "STOP\n").unwrap();
+            i2c.ctlr1().write_value(i2c.ctlr1().read());
+            continue;
+        }
+
+        if next.addr() {
+            /*writeln!(
+                uart,
+                "2: {:#x}: {:#x}\r",
+                i2c.star2().read().0,
+                i2c.datar().read().datar()
+            )
+            .unwrap();*/
+            i2c.star2().read();
+            continue;
+        }
+    }
+
     let mut star1;
     let mut star2;
     loop {

@@ -15,7 +15,8 @@ embassy-executor = { version = "0.6.0", features = [
     "integrated-timers",
     "arch-spin",
     "executor-thread",
-    "task-arena-size-128", # or better use nightly, but fails on recent Rust versions
+    "nightly"
+#    "task-arena-size-128", # or better use nightly, but fails on recent Rust versions
 ] }
 embassy-time = { version = "0.3.0" }
 embassy-sync = { version = "0.6.2" }
@@ -41,8 +42,10 @@ numtoa = "*"
 strip = false   # symbols are not flashed to the microcontroller, so don't strip them.
 lto = true
 opt-level = "s" # Optimize for size.
+panic = 'abort'
 
 [profile.dev]
 strip = false   # symbols are not flashed to the microcontroller, so don't strip them.
 lto = true
 opt-level = 2 # Optimize for size.
+panic = 'abort'

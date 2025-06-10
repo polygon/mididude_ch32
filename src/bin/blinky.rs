@@ -3,26 +3,28 @@
 #![feature(type_alias_impl_trait)]
 #![feature(impl_trait_in_assoc_type)]
 
+use ch32_hal as hal;
 use ch32_hal::bind_interrupts;
 use ch32_hal::pac::gpio::vals::{Cnf, Mode};
+use core::arch::asm;
 use core::fmt::Write;
+use embassy_executor::{SpawnError, Spawner};
 use hal::delay::Delay;
 use hal::gpio::{Level, Output};
 use hal::i2c::I2c;
 use hal::println;
 use hal::usart::UartTx;
 use numtoa::NumToA;
-use {ch32_hal as hal, panic_halt as _};
 
-use mididude_adc::i2c_device::{self, init_i2c_device, monitor_addr, Config, I2cSlave};
+use mididude_adc::i2c_device::{self, monitor_addr, Config, I2cSlave};
 
 bind_interrupts!(struct Irqs {
     I2C1_EV => mididude_adc::i2c_device::EventInterruptHandler<ch32_hal::peripherals::I2C1>;
     I2C1_ER => mididude_adc::i2c_device::ErrorInterruptHandler<ch32_hal::peripherals::I2C1>;
 });
 
-#[qingke_rt::entry]
-fn main() -> ! {
+#[embassy_executor::main(entry = "qingke_rt::entry")]
+async fn main(spawner: Spawner) -> ! {
     //hal::debug::SDIPrint::enable();
     let mut config = hal::Config::default();
     config.rcc = hal::rcc::Config::SYSCLK_FREQ_48MHZ_HSI;
@@ -36,7 +38,7 @@ fn main() -> ! {
     config.addr = 0x10;
     config.general_call = false;
 
-    let i2c = I2cSlave::new(p.I2C1, config, p.PC1, p.PC2, Irqs);
+    let mut i2c = I2cSlave::new(p.I2C1, config, p.PC1, p.PC2, Irqs);
 
     let mut adc = hal::adc::Adc::new(p.ADC1, Default::default());
 
@@ -45,9 +47,14 @@ fn main() -> ! {
 
     writeln!(uart, "Formatted {}\n", 12).unwrap();
 
-    init_i2c_device(0x10, &mut uart);
+    let mut buf = [0; 8];
+
     loop {
-        monitor_addr(&mut uart);
+        let res = i2c.listen(&mut buf, &mut uart).await;
+        match res {
+            Ok(a) => writeln!(uart, "Ok: {:?}\r", a).unwrap(),
+            Err(e) => writeln!(uart, "Error: {:?}\r", e).unwrap(),
+        }
     }
 
     loop {
@@ -70,4 +77,12 @@ fn main() -> ! {
         //let val = hal::pac::SYSTICK.cnt().read();
         //hal::println!("systick: {}", val);
     }
+}
+
+use core::panic::PanicInfo;
+
+#[inline(never)]
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    loop {}
 }
